@@ -1,0 +1,260 @@
+/*
+  GrainGuard AI - ESP32 firmware (fixed version)
+  Libraries: "DHT sensor library" (Adafruit) + "Adafruit Unified Sensor",
+             "Adafruit SSD1306", "Adafruit GFX Library".
+  Board: "ESP32 Dev Module", Serial Monitor/baud: 115200.
+
+  Sends one line per second:  DATA,millis,audio_rms,vibration_events,temp_c,humidity_pct
+  Accepts from the PC:        BUZZER,1 | BUZZER,0   and   LEVEL,0 | LEVEL,1 | LEVEL,2
+*/
+#include <Arduino.h>
+#include <DHT.h>
+#include "driver/i2s.h"
+#include <math.h>
+#include <Wire.h>                                                                     
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// ---------------- Pins ----------------
+#define DHTPIN 4
+#define DHTTYPE DHT22
+#define SW420_PIN 32
+#define GREEN_LED 18
+#define YELLOW_LED 19
+#define RED_LED 23
+#define BUZZER_PIN 27
+#define I2S_WS 25
+#define I2S_SCK 26
+#define I2S_SD 33
+#defi ne OLED_SDA 21
+#define OLED_SCL 22
+#define OLED_ADDR 0x3D               // try 0x3D if the screen stays blank
+
+// ---------------- Tuning ----------------
+const int SAMPLE_RATE = 16000;
+const int AUDIO_SAMPLES = 1024;   // about 64 ms of audio per block
+const float AUDIO_SCALE = 64.0;   // scales the 24-bit value down to a readable number
+const unsigned long REPORT_MS = 1000;        // one DATA line per second
+const unsigned long LEVEL_TIMEOUT_MS = 5000; // PC silent this long = local LED mode
+const unsigned long DHT_INTERVAL_MS = 2500;
+const unsigned long VIB_DEBOUNCE_US = 30000;
+
+Adafruit_SSD1306 oled(128, 64, &Wire, -1);
+DHT dht(DHTPIN, DHTTYPE);
+
+bool oledOk = false;
+volatile unsigned long vibrationEvents = 0;
+volatile unsigned long lastVibrationUs = 0;
+unsigned long totalVibration = 0;
+
+bool buzzerState = false;
+int serverLevel = 0;              // 0 normal, 1 warning, 2 danger (sent by the PC)
+unsigned long lastLevelMs = 0;
+bool haveLevel = false;
+
+float temperatureC = NAN, humidityPct = NAN;
+unsigned long lastDhtMs = 0, dhtFails = 0;
+
+float lastRms = 0;
+unsigned long lastEvents = 0;
+double rmsSum = 0;
+int rmsCount = 0;
+bool audioOk = false;
+unsigned long windowStart = 0;
+unsigned long lastOledMs = 0;
+
+static int32_t blk[AUDIO_SAMPLES];
+
+void IRAM_ATTR onVibration() {
+  unsigned long now = micros();
+  if (now - lastVibrationUs > VIB_DEBOUNCE_US) {
+    vibrationEvents++;
+    lastVibrationUs = now;
+  }
+}
+
+void setupI2S() {
+  i2s_config_t cfg = {};
+  cfg.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX);
+  cfg.sample_rate = SAMPLE_RATE;
+  cfg.bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT;
+  cfg.channel_format = I2S_CHANNEL_FMT_ONLY_LEFT;   // INMP441 L/R pin must be on GND
+  cfg.communication_format = I2S_COMM_FORMAT_STAND_I2S;
+  cfg.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
+  cfg.dma_buf_count = 4;
+  cfg.dma_buf_len = 256;
+  cfg.use_apll = false;
+
+  i2s_pin_config_t pins = {};
+  pins.mck_io_num = I2S_PIN_NO_CHANGE;
+  pins.bck_io_num = I2S_SCK;
+  pins.ws_io_num = I2S_WS;
+  pins.data_out_num = I2S_PIN_NO_CHANGE;
+  pins.data_in_num = I2S_SD;
+
+  if (i2s_driver_install(I2S_NUM_0, &cfg, 0, NULL) != ESP_OK) Serial.println("ERROR,I2S_DRIVER");
+  if (i2s_set_pin(I2S_NUM_0, &pins) != ESP_OK) Serial.println("ERROR,I2S_PINS");
+  i2s_zero_dma_buffer(I2S_NUM_0);
+}
+
+// Returns the AC loudness of one block. The microphone's constant DC offset is
+// removed first; otherwise the value would always look "loud".
+// Never blocks for more than ~400 ms, so a bad mic wire cannot freeze the board.
+float readAudioRMS(bool &ok) {
+  int32_t tmp[256];
+  int total = 0;
+  unsigned long start = millis();
+  while (total < AUDIO_SAMPLES && millis() - start < 400) {
+    size_t bytesRead = 0;
+    esp_err_t r = i2s_read(I2S_NUM_0, tmp, sizeof(tmp), &bytesRead, pdMS_TO_TICKS(100));
+    if (r != ESP_OK || bytesRead == 0) continue;
+    int n = bytesRead / sizeof(int32_t);
+    for (int i = 0; i < n && total < AUDIO_SAMPLES; i++) blk[total++] = tmp[i] >> 8;
+  }
+  ok = (total >= AUDIO_SAMPLES / 2);
+  if (total == 0) return 0;
+  double mean = 0;
+  for (int i = 0; i < total; i++) mean += blk[i];
+  mean /= total;
+  double ss = 0;
+  for (int i = 0; i < total; i++) { double d = blk[i] - mean; ss += d * d; }
+  return (float)(sqrt(ss / total) / AUDIO_SCALE);
+}
+
+void readDHT() {
+  if (millis() - lastDhtMs < DHT_INTERVAL_MS) return;
+  lastDhtMs = millis();
+  float t = dht.readTemperature();
+  float h = dht.readHumidity();
+  if (isnan(t) || isnan(h)) {
+    dhtFails++;
+    if (dhtFails % 3 == 1) Serial.println("ERROR,DHT_READ_FAILED (check DATA on GPIO4, 3V3, GND, 10k pull-up)");
+    return;
+  }
+  temperatureC = t;
+  humidityPct = h;
+}
+
+void setLeds(int level) {
+  digitalWrite(GREEN_LED,  level == 0 ? HIGH : LOW);
+  digitalWrite(YELLOW_LED, level == 1 ? HIGH : LOW);
+  digitalWrite(RED_LED,    level >= 2 ? HIGH : LOW);
+}
+
+bool serverFresh() { return haveLevel && (millis() - lastLevelMs < LEVEL_TIMEOUT_MS); }
+
+void handleSerialCommands() {
+  static String cmd;
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '\n' || c == '\r') {
+      cmd.trim();
+      if (cmd == "BUZZER,1") buzzerState = true;
+      else if (cmd == "BUZZER,0") buzzerState = false;
+      else if (cmd.startsWith("LEVEL,")) {
+        serverLevel = constrain(cmd.substring(6).toInt(), 0, 2);
+        lastLevelMs = millis();
+        haveLevel = true;
+      }
+      cmd = "";
+    } else if (cmd.length() < 40) {
+      cmd += c;
+    }
+  }
+  digitalWrite(BUZZER_PIN, buzzerState ? HIGH : LOW);
+}
+
+void setupOLED() {
+  Wire.begin(OLED_SDA, OLED_SCL);
+  Wire.setClock(400000);
+  oledOk = oled.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
+  if (!oledOk) { Serial.println("ERROR,OLED_NOT_FOUND (check SDA GPIO21, SCL GPIO22, address)"); return; }
+  oled.clearDisplay();
+  oled.setTextColor(SSD1306_WHITE);
+  oled.setTextSize(1);
+  oled.setCursor(0, 0);  oled.println("GrainGuard AI");
+  oled.setCursor(0, 16); oled.println("Starting sensors...");
+  oled.display();
+}
+
+void updateOLED() {
+  if (!oledOk) return;
+  oled.clearDisplay();
+  oled.setTextSize(1);
+  oled.setCursor(0, 0);  oled.print("GrainGuard AI");
+  oled.drawLine(0, 10, 127, 10, SSD1306_WHITE);
+  oled.setCursor(0, 14);
+  if (isnan(temperatureC)) oled.print("Temp : --");
+  else { oled.print("Temp : "); oled.print(temperatureC, 1); oled.print(" C"); }
+  oled.setCursor(0, 24);
+  if (isnan(humidityPct)) oled.print("Humid: --");
+  else { oled.print("Humid: "); oled.print(humidityPct, 1); oled.print(" %"); }
+  oled.setCursor(0, 34); oled.print("Sound: "); oled.print(lastRms, 0);
+  oled.setCursor(0, 44); oled.print("Vib  : "); oled.print(lastEvents); oled.print("/s  tot "); oled.print(totalVibration);
+  oled.setCursor(0, 54);
+  if (serverFresh()) {
+    oled.print("Status: ");
+    oled.print(serverLevel == 0 ? "NORMAL" : (serverLevel == 1 ? "WARNING" : "DANGER"));
+  } else {
+    oled.print("PC link: offline");
+  }
+  oled.display();
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(SW420_PIN, INPUT_PULLUP);
+  pinMode(GREEN_LED, OUTPUT);
+  pinMode(YELLOW_LED, OUTPUT);
+  pinMode(RED_LED, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+  setLeds(0);
+
+  dht.begin();
+  setupOLED();
+  setupI2S();
+  attachInterrupt(digitalPinToInterrupt(SW420_PIN), onVibration, FALLING);
+
+  windowStart = millis();
+  Serial.println("GRAINGUARD_READY");
+}
+
+void loop() {
+  handleSerialCommands();
+
+  bool ok = false;
+  float rms = readAudioRMS(ok);
+  audioOk = ok;
+  if (ok) { rmsSum += rms; rmsCount++; }
+  readDHT();
+
+  if (millis() - windowStart >= REPORT_MS) {
+    windowStart = millis();
+
+    noInterrupts();
+    unsigned long events = vibrationEvents;
+    vibrationEvents = 0;
+    interrupts();
+
+    lastRms = rmsCount ? (float)(rmsSum / rmsCount) : 0;
+    rmsSum = 0; rmsCount = 0;
+    lastEvents = events;
+    totalVibration += events;
+
+    // LEDs follow the website's decision; without the PC they follow raw activity.
+    setLeds(serverFresh() ? serverLevel : (events > 0 ? 1 : 0));
+
+    if (!audioOk) Serial.println("ERROR,MIC_NO_DATA (check INMP441 SCK/WS/SD, 3V3, GND, L/R to GND)");
+
+    Serial.print("DATA,");
+    Serial.print(millis());       Serial.print(",");
+    Serial.print(lastRms, 2);     Serial.print(",");
+    Serial.print(events);         Serial.print(",");
+    if (isnan(temperatureC)) Serial.print("nan"); else Serial.print(temperatureC, 1);
+    Serial.print(",");
+    if (isnan(humidityPct)) Serial.println("nan"); else Serial.println(humidityPct, 1);
+
+    updateOLED();
+  }
+}
